@@ -2,16 +2,86 @@ import torch
 from lib import utils
 from lib.model_interface import ModelInterface
 from MyModel.loss import MyModelLoss
-from MyModel.nets import MyGenerator
-from pg_modules.projected_discriminator import ProjectedDiscriminator
+import os, tqdm, wandb, torchvision
+import numpy as np
+import cv2, time
+from nerf import (get_embedding_function, get_ray_bundle, img2mse,
+                  load_blender_data, load_llff_data, meshgrid_xy, models,
+                  mse2psnr, run_one_iter_of_nerf)
 
 
 class MyModel(ModelInterface):
     def set_networks(self):
-        self.G = MyGenerator().cuda(self.gpu).train()
-        self.D = ProjectedDiscriminator().cuda(self.gpu).train()
-        self.D.feature_network.eval()
-        self.D.feature_network.requires_grad_(False)
+
+        self.encode_position_fn = get_embedding_function(
+            num_encoding_functions=self.args["models"]["coarse"]["num_encoding_fn_xyz"],
+            include_input=self.args["models"]["coarse"]["include_input_xyz"],
+            log_sampling=self.args["models"]["coarse"]["log_sampling_xyz"],
+        )
+
+        self.encode_direction_fn = None
+        if self.args.models["coarse"]["use_viewdirs"]:
+            self.encode_direction_fn = get_embedding_function(
+                num_encoding_functions=self.args["models"]["coarse"]["num_encoding_fn_dir"],
+                include_input=self.args["models"]["coarse"]["include_input_dir"],
+                log_sampling=self.args["models"]["coarse"]["log_sampling_dir"],
+            )
+
+        # Initialize a coarse-resolution model.
+        self.model_coarse = getattr(models, self.args["models"]["coarse"]["type"])(
+            num_encoding_fn_xyz=self.args["models"]["coarse"]["num_encoding_fn_xyz"],
+            num_encoding_fn_dir=self.args["models"]["coarse"]["num_encoding_fn_dir"],
+            include_input_xyz=self.args["models"]["coarse"]["include_input_xyz"],
+            include_input_dir=self.args["models"]["coarse"]["include_input_dir"],
+            use_viewdirs=self.args["models"]["coarse"]["use_viewdirs"],
+        )
+        self.model_coarse.cuda().train()
+
+        # If a fine-resolution model is specified, initialize it["
+        self.model_fine = None
+        if self.args.models.__contains__("fine"):
+            self.model_fine = getattr(models, self.args["models"]["fine"]["type"])(
+                num_encoding_fn_xyz=self.args["models"]["fine"]["num_encoding_fn_xyz"],
+                num_encoding_fn_dir=self.args["models"]["fine"]["num_encoding_fn_dir"],
+                include_input_xyz=self.args["models"]["fine"]["include_input_xyz"],
+                include_input_dir=self.args["models"]["fine"]["include_input_dir"],
+                use_viewdirs=self.args["models"]["fine"]["use_viewdirs"],
+            )
+            self.model_fine.cuda().train()
+
+
+    def set_multi_GPU(self):
+        utils.setup_ddp(self.gpu, self.args.gpu_num)
+
+        # Data parallelism is required to use multi-GPU
+        # self.model_coarse = torch.nn.parallel.DistributedDataParallel(self.model_coarse, device_ids=[self.gpu]=False, find_unused_parameters=True).module
+        self.model_coarse = torch.nn.parallel.DistributedDataParallel(self.model_coarse, device_ids=[self.gpu]).module
+        self.model_fine = torch.nn.parallel.DistributedDataParallel(self.model_fine, device_ids=[self.gpu]).module
+
+    def set_dataset(self):
+        if self.args.dataset["type"].lower() == "blender":
+            self.images, self.poses, render_poses, hwf, i_split = load_blender_data(self.args.dataset["basedir"], half_res=self.args.dataset["half_res"], testskip=self.args.dataset["testskip"])
+            self.i_train, self.i_val, i_test = i_split
+            H, W, self.focal = hwf
+            self.H, self.W = int(H), int(W)
+            self.hwf = [self.H, self.W, self.focal]
+            if self.args.nerf["train"]["white_background"]:
+                self.images = self.images[..., :3] * self.images[..., -1:] + (1.0 - self.images[..., -1:])
+
+    def set_optimizers(self):
+        trainable_parameters = list(self.model_coarse.parameters())
+        if self.model_fine is not None:
+            trainable_parameters += list(self.model_fine.parameters())
+        self.optimizer = getattr(torch.optim, self.args["optimizer"]["type"])(trainable_parameters, lr=self.args["optimizer"]["lr"])
+
+    def load_checkpoint(self):
+        checkpoint = torch.load(self.args.load_checkpoint)
+        self.model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
+        if checkpoint["model_fine_state_dict"]:
+            self.model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_iter = checkpoint["iter"]
+        return start_iter
 
     def set_loss_collector(self):
         self._loss_collector = MyModelLoss(self.args)
@@ -19,66 +89,130 @@ class MyModel(ModelInterface):
     def go_step(self, global_step):
         # load batch
 
-        I_source, I_target, same_person = self.load_next_batch()
-        same_person = same_person.reshape(-1, 1, 1, 1).repeat(1, 3, 256, 256)
+        self.model_coarse.train()
+        if self.model_fine:
+            self.model_fine.train()
 
-        self.dict["I_source"] = I_source
-        self.dict["I_target"] = I_target
-        self.dict["same_person"] = same_person
+        ###########################
+        # 6-1. mini batch
+        ###########################
 
-        # run G
-        self.run_G()
+        img_idx = np.random.choice(self.i_train)
+        img_target = self.images[img_idx].cuda()
+        pose_target = self.poses[img_idx, :3, :4].cuda()
+        ray_origins, ray_directions = get_ray_bundle(self.H, self.W, self.focal, pose_target)
+        coords = torch.stack(meshgrid_xy(torch.arange(self.H).cuda(), torch.arange(self.W).cuda()), dim=-1).reshape((-1, 2))
+        
+        select_inds = np.random.choice(coords.shape[0], size=(self.args.nerf["train"]["num_random_rays"]), replace=False)
+        select_inds = coords[select_inds]
+        ray_origins = ray_origins[select_inds[:, 0], select_inds[:, 1], :]
+        ray_directions = ray_directions[select_inds[:, 0], select_inds[:, 1], :]
+        target_s = img_target[select_inds[:, 0], select_inds[:, 1], :]
 
-        # update G
-        loss_G = self.loss_collector.get_loss_G(self.dict)
-        utils.update_net(self.opt_G, loss_G)
+        # run
+        rgb_coarse, _, _, rgb_fine, _, _ = run_one_iter_of_nerf(
+            self.H,
+            self.W,
+            self.focal,
+            self.model_coarse,
+            self.model_fine,
+            ray_origins,
+            ray_directions,
+            self.args,
+            mode="train",
+            encode_position_fn=self.encode_position_fn,
+            encode_direction_fn=self.encode_direction_fn,
+        )
 
-        # run D
-        self.run_D()
+        loss = self.loss_collector.get_loss(rgb_coarse, rgb_fine, target_s)
 
-        # update D
-        loss_D = self.loss_collector.get_loss_D(self.dict)
-        utils.update_net(self.opt_D, loss_D)
+        ###########################
+        # 6-3. update
+        ###########################
 
-        # print images
-        self.train_images = [
-            self.dict["I_source"], 
-            self.dict["I_target"], 
-            self.dict["I_swapped"]
-            ]
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
 
-    def run_G(self):
-        I_swapped, id_source = self.G(self.dict["I_source"], self.dict["I_target"])
-        I_cycle, _ = self.G(self.dict["I_target"], I_swapped)
-        id_swapped = self.G.get_id(I_swapped)
-        d_adv, feat_fake = self.D(I_swapped, None)
-        feat_real = self.D.get_feature(self.dict["I_target"])
+        # Learning rate updates
+        num_decay_steps = self.args.scheduler["lr_decay"] * 1000
+        lr_new = self.args.optimizer["lr"] * (self.args.scheduler["lr_decay_factor"] ** (global_step / num_decay_steps))
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr_new
 
-        self.dict["I_swapped"] = I_swapped
-        self.dict["I_cycle"] = I_cycle
-        self.dict["id_source"] = id_source
-        self.dict["id_swapped"] = id_swapped
-        self.dict["d_adv"] = d_adv
-        self.dict["feat_real"] = feat_real
-        self.dict["feat_fake"] = feat_fake
+    def do_validation(self, global_step):
+        self.model_coarse.eval()
+        if self.model_fine:
+            self.model_fine.eval()
 
-    def run_D(self):
-        d_real, _ = self.D(self.dict["I_source"], None)
-        d_fake, _ = self.D(self.dict["I_swapped"].detach(), None)
-
-        self.dict["d_real"] = d_real
-        self.dict["d_fake"] = d_fake
-
-    def do_validation(self, step):
+        start = time.time()
         with torch.no_grad():
-            result_images = self.G(self.valid_source, self.valid_target)[0]
-        self.valid_images = [
-            self.valid_source, 
-            self.valid_target, 
-            result_images
-            ]
+            img_idx = np.random.choice(self.i_val)
+            img_target = self.images[img_idx].cuda()
+            pose_target = self.poses[img_idx, :3, :4].cuda()
+            ray_origins, ray_directions = get_ray_bundle(self.H, self.W, self.focal, pose_target)
+            rgb_coarse, _, _, rgb_fine, _, _ = run_one_iter_of_nerf(
+                self.H,
+                self.W,
+                self.focal,
+                self.model_coarse,
+                self.model_fine,
+                ray_origins,
+                ray_directions,
+                self.args,
+                mode="validation",
+                encode_position_fn=self.encode_position_fn,
+                encode_direction_fn=self.encode_direction_fn,
+            )
+
+            coarse_loss = img2mse(rgb_coarse[..., :3], img_target[..., :3])
+            if rgb_fine is not None:
+                fine_loss = img2mse(rgb_fine[..., :3], img_target[..., :3])
+            loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
+            psnr = mse2psnr(loss.item())
+
+            self.val_loss_dict = {}
+            self.val_loss_dict["loss_valid"] = loss.item(),
+            self.val_loss_dict["coarse_loss_valid"] = coarse_loss.item()
+            if rgb_fine is not None:
+                self.val_loss_dict["fine_loss_valid"] = fine_loss.item()
+            self.val_loss_dict["psnr_valid"] = psnr
+            
+            os.makedirs(f"{self.args.save_root}/{self.args.run_id}/validation/rgb_coarse/", exist_ok=True)
+            cv2.imwrite(f"{self.args.save_root}/{self.args.run_id}/validation/rgb_coarse/{str(global_step).zfill(5)}.png", self.cast_to_image(rgb_coarse[..., :3])[:, :, ::-1])
+            if rgb_fine is not None:
+                os.makedirs(f"{self.args.save_root}/{self.args.run_id}/validation/rgb_fine/", exist_ok=True)
+                os.makedirs(f"{self.args.save_root}/{self.args.run_id}/validation/img_target/", exist_ok=True)
+                cv2.imwrite(f"{self.args.save_root}/{self.args.run_id}/validation/rgb_fine/{str(global_step).zfill(5)}.png", self.cast_to_image(rgb_fine[..., :3])[:, :, ::-1])
+                cv2.imwrite(f"{self.args.save_root}/{self.args.run_id}/validation/img_target/{str(global_step).zfill(5)}.png", self.cast_to_image(img_target[..., :3])[:, :, ::-1])
+
+            tqdm.tqdm.write(f"Validation loss: {str(round(loss.item(), 4))} | Validation PSNR: {str(round(psnr, 2))} | Time: {str(round(time.time() - start, 2))}")
+
+        ###########################
+        # 6-6. Checkpoints
+        ###########################
+
+    def save_checkpoint(self, global_step):
+        os.makedirs(f"{self.args.save_root}/{self.args.run_id}/checkpoints", exist_ok=True)
+        checkpoint_dict = {
+            "iter": global_step,
+            "model_coarse_state_dict": self.model_coarse.state_dict(),
+            "model_fine_state_dict": None
+            if not self.model_fine
+            else self.model_fine.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+        }
+
+        torch.save(checkpoint_dict, f"{self.args.save_root}/{self.args.run_id}/checkpoints/{str(global_step).zfill(5)}.ckpt")
+        tqdm.tqdm.write("================== Saved Checkpoint =================")
 
     @property
     def loss_collector(self):
         return self._loss_collector
+        
+    def cast_to_image(self, tensor):
+        tensor = tensor.permute(2, 0, 1)
+        img = np.array(torchvision.transforms.ToPILImage()(tensor.detach().cpu()))
+        return img
+        
         

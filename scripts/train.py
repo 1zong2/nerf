@@ -13,7 +13,7 @@ def train(gpu, args):
     torch.cuda.set_device(gpu)
 
     # convert dictionary to class
-    args = Config(args)    
+    args = Config(args)   
     model = MyModel(args, gpu)
 
     # Initialize wandb to gather and display loss on dashboard 
@@ -21,7 +21,7 @@ def train(gpu, args):
         wandb.init(project=args.model_id, name=args.run_id)
 
     # Training loop
-    global_step = args.global_step if args.load_ckpt else 0
+    global_step = args.global_step
     while global_step < args.max_step:
 
         # go one step
@@ -31,17 +31,14 @@ def train(gpu, args):
             # Save and print loss
             if global_step % args.loss_cycle == 0:
                 model.loss_collector.print_loss(global_step)
-
                 if args.use_wandb:
                     wandb.log(model.loss_collector.loss_dict)
                 
             # Save image
             if global_step % args.test_cycle == 0:
-                save_image(model.args, global_step, "train_imgs", model.train_images)
-
-                if args.use_validation:
-                    model.do_validation(global_step) 
-                    save_image(model.args, global_step, "valid_imgs", model.valid_images)
+                model.do_validation(global_step) 
+                if args.use_wandb:
+                    wandb.log(model.val_loss_dict)
 
             # Save checkpoint parameters 
             if global_step % args.ckpt_cycle == 0:
@@ -61,8 +58,8 @@ if __name__ == "__main__":
     args.gpu_num = torch.cuda.device_count()
     
     # save config
-    os.makedirs(f"{args.save_root}/{args.run_id}", exist_ok=True)
-    args.save_yaml()
+    os.makedirs(f"train_result/{args.run_id}", exist_ok=True)
+    # args.save_yaml()
 
     # Set up multi-GPU training
     if args.use_mGPU:  

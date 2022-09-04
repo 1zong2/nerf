@@ -1,5 +1,4 @@
 import abc
-from packages.lpips.lpips import LPIPS
 import torch
 import torch.nn.functional as F
 import time
@@ -28,27 +27,7 @@ class LossInterface(metaclass=abc.ABCMeta):
         print("")
         print(f"[ {seconds//3600//24:02}d {(seconds//3600)%24:02}h {(seconds//60)%60:02}m {seconds%60:02}s ]")
         print(f'steps: {global_step:06} / {self.args.max_step}')
-        print(f'lossD: {self.loss_dict["L_D"]} | lossG: {self.loss_dict["L_G"]}')
-
-    @abc.abstractmethod
-    def get_loss_G(self):
-        """
-        Caculate generator loss.
-        Once loss values are saved in self.loss_dict, they can be uploaded on the 
-        dashboard via wandb or printed in self.print_loss. self.print_loss can be 
-        overrided as needed.
-        """
-        pass
-
-    @abc.abstractmethod
-    def get_loss_D(self):
-        """
-        Caculate discriminator loss.
-        Once loss values are saved in self.loss_dict, they can be uploaded on the 
-        dashboard via wandb or printed in self.print_loss. self.print_loss can be 
-        overrided as needed.
-        """
-        pass
+        print(self.loss_dict)
 
 
 class Loss:

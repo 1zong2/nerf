@@ -1,10 +1,9 @@
-import abc
+import abc, os
 import torch
 from torch.utils.data import DataLoader
 from lib.dataset import PairedFaceDatasetTrain, PairedFaceDatasetValid
 from lib import utils, checkpoint
 import numpy as np
-from packages import Ranger
 
 class ModelInterface(metaclass=abc.ABCMeta):
     """
@@ -26,18 +25,20 @@ class ModelInterface(metaclass=abc.ABCMeta):
     def SetupModel(self):
         self.args.isMaster = self.gpu == 0
         self.RandomGenerator = np.random.RandomState(42)
+        np.random.seed(42)
+        torch.manual_seed(42)
         self.set_networks()
         self.set_optimizers()
 
         if self.args.use_mGPU:
             self.set_multi_GPU()
 
-        if self.args.load_ckpt:
+        if os.path.exists(self.args.load_checkpoint):
             self.load_checkpoint()
 
         self.set_dataset()
-        self.set_data_iterator()
-        self.set_validation()
+        # self.set_data_iterator()
+        # self.set_validation()
         self.set_loss_collector()
 
         if self.args.isMaster:

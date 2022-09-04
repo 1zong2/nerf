@@ -1,6 +1,7 @@
 train_result/
 wandb/
 *.zip
+assets/nerf_synthetic/
 
 # to remain gitkeep
 !packages/
