@@ -18,7 +18,7 @@ global_step: 0
 loss_cycle: 100
 test_cycle: 1000
 ckpt_cycle: 5000
-max_step: 200000
+max_step: 100000 # 200000
 batch_per_gpu: 1
 
 # Parameters to setup experiment.

@@ -145,8 +145,6 @@ class MyModel(ModelInterface):
         if self.model_fine:
             self.model_fine.eval()
 
-        print(1)
-        time.sleep(5)
         start = time.time()
         with torch.no_grad():
             
@@ -158,7 +156,7 @@ class MyModel(ModelInterface):
 
             img_target, pose = img[0].to(self.gpu), pose[0].to(self.gpu)
             pose_target = pose[:3, :4]
-                
+            
             ray_origins, ray_directions = get_ray_bundle(self.H, self.W, self.focal, pose_target)
             
             rgb_coarse, _, _, rgb_fine, _, _ = run_one_iter_of_nerf(
@@ -174,18 +172,19 @@ class MyModel(ModelInterface):
                 encode_position_fn=self.encode_position_fn,
                 encode_direction_fn=self.encode_direction_fn,
             )
-            coarse_loss = img2mse(rgb_coarse[..., :3], img_target[..., :3]).item()
-            if rgb_fine is not None:
-                fine_loss = img2mse(rgb_fine[..., :3], img_target[..., :3]).item()
-            loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
-            psnr = mse2psnr(loss)
 
-            self.val_loss_dict = {}
-            self.val_loss_dict["loss_valid"] = loss,
-            self.val_loss_dict["coarse_loss_valid"] = coarse_loss
-            if rgb_fine is not None:
-                self.val_loss_dict["fine_loss_valid"] = fine_loss
-            self.val_loss_dict["psnr_valid"] = psnr
+            # coarse_loss = img2mse(rgb_coarse[..., :3], img_target[..., :3]).item()
+            # if rgb_fine is not None:
+            #     fine_loss = img2mse(rgb_fine[..., :3], img_target[..., :3]).item()
+            # loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
+            # psnr = mse2psnr(loss)
+
+            # self.val_loss_dict = {}
+            # self.val_loss_dict["loss_valid"] = loss,
+            # self.val_loss_dict["coarse_loss_valid"] = coarse_loss
+            # if rgb_fine is not None:
+            #     self.val_loss_dict["fine_loss_valid"] = fine_loss
+            # self.val_loss_dict["psnr_valid"] = psnr
             
             os.makedirs(f"{self.args.save_root}/{self.args.run_id}/validation/rgb_coarse/", exist_ok=True)
             cv2.imwrite(f"{self.args.save_root}/{self.args.run_id}/validation/rgb_coarse/{str(global_step).zfill(5)}.png", self.cast_to_image(rgb_coarse[..., :3])[:, :, ::-1])
@@ -195,7 +194,7 @@ class MyModel(ModelInterface):
                 cv2.imwrite(f"{self.args.save_root}/{self.args.run_id}/validation/rgb_fine/{str(global_step).zfill(5)}.png", self.cast_to_image(rgb_fine[..., :3])[:, :, ::-1])
                 cv2.imwrite(f"{self.args.save_root}/{self.args.run_id}/validation/img_target/{str(global_step).zfill(5)}.png", self.cast_to_image(img_target[..., :3])[:, :, ::-1])
 
-            tqdm.tqdm.write(f"Validation loss: {str(round(loss, 4))} | Validation PSNR: {str(round(psnr, 2))} | Time: {str(round(time.time() - start, 2))}")
+            # tqdm.tqdm.write(f"Validation loss: {str(round(loss, 4))} | Validation PSNR: {str(round(psnr, 2))} | Time: {str(round(time.time() - start, 2))}")
 
         ###########################
         # 6-6. Checkpoints

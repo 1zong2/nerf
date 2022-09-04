@@ -124,7 +124,7 @@ def predict_and_render_radiance(
 
     return rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine
 
-
+import time
 def run_one_iter_of_nerf(
     height,
     width,
@@ -182,9 +182,10 @@ def run_one_iter_of_nerf(
         torch.cat(image, dim=0) if image[0] is not None else (None)
         for image in synthesized_images
     ]
+
     if mode == "validation":
         synthesized_images = [
-            image.view(shape) if image is not None else None
+            image.reshape(shape) if image is not None else None
             for (image, shape) in zip(synthesized_images, restore_shapes)
         ]
 
