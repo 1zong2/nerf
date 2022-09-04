@@ -1,7 +1,7 @@
 import abc, os
 import torch
 from torch.utils.data import DataLoader
-from lib.dataset import PairedFaceDatasetTrain, PairedFaceDatasetValid
+from lib.dataset import NerfDataset
 from lib import utils, checkpoint
 import numpy as np
 
@@ -37,7 +37,7 @@ class ModelInterface(metaclass=abc.ABCMeta):
             self.load_checkpoint()
 
         self.set_dataset()
-        # self.set_data_iterator()
+        self.set_data_iterator()
         # self.set_validation()
         self.set_loss_collector()
 
@@ -61,9 +61,8 @@ class ModelInterface(metaclass=abc.ABCMeta):
         """
         Initialize dataset using the dataset paths specified in the command line arguments.
         """
-        self.train_dataset = PairedFaceDatasetTrain(self.args.train_dataset_root_list, self.args.isMaster, same_prob=self.args.same_prob)
-        if self.args.valid_dataset_root:
-            self.valid_dataset = PairedFaceDatasetValid(self.args.valid_dataset_root, self.args.isMaster)
+        self.train_dataset = NerfDataset(self.args.dataset["basedir"], half_res=self.args.dataset["half_res"], testskip=self.args.dataset["testskip"], isMaster=self.args.isMaster, mode="train")
+        self.valid_dataset = NerfDataset(self.args.dataset["basedir"], half_res=self.args.dataset["half_res"], testskip=self.args.dataset["testskip"], isMaster=self.args.isMaster, mode="val")
 
     def set_data_iterator(self):
         """
@@ -73,17 +72,10 @@ class ModelInterface(metaclass=abc.ABCMeta):
         """
         sampler = torch.utils.data.distributed.DistributedSampler(self.train_dataset) if self.args.use_mGPU else None
         self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_per_gpu, pin_memory=True, sampler=sampler, num_workers=8, drop_last=True)
-        self.train_iterator = iter(self.train_dataloader)
+        self.valid_dataloader = DataLoader(self.valid_dataset, batch_size=self.args.batch_per_gpu, pin_memory=True, sampler=sampler, num_workers=8, drop_last=True)
 
-    def set_validation(self):
-        """
-        Predefine test images only if args.valid_dataset_root is specified.
-        These images are anchored for checking the improvement of the model.
-        """
-        if self.args.use_validation:
-            self.valid_dataloader = DataLoader(self.valid_dataset, batch_size=self.args.batch_per_gpu, num_workers=8, drop_last=True)
-            I_source, I_target = next(iter(self.valid_dataloader))
-            self.valid_source, self.valid_target = I_source.to(self.gpu), I_target.to(self.gpu)
+        self.train_iterator = iter(self.train_dataloader)
+        self.valid_iterator = iter(self.valid_dataloader)
 
     @abc.abstractmethod
     def set_networks(self):

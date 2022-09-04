@@ -47,7 +47,7 @@ def predict_and_render_radiance(
         1.0,
         options.nerf[f"{mode}"]["num_coarse"],
         dtype=ro.dtype,
-        device=ro.device,
+        device="cuda",
     )
     if not options.nerf[f"{mode}"]["lindisp"]:
         z_vals = near * (1.0 - t_vals) + far * t_vals
@@ -61,7 +61,7 @@ def predict_and_render_radiance(
         upper = torch.cat((mids, z_vals[..., -1:]), dim=-1)
         lower = torch.cat((z_vals[..., :1], mids), dim=-1)
         # Stratified samples in those intervals.
-        t_rand = torch.rand(z_vals.shape, dtype=ro.dtype, device=ro.device)
+        t_rand = torch.rand(z_vals.shape, dtype=ro.dtype, device="cuda")
         z_vals = lower + (upper - lower) * t_rand
     # pts -> (num_rays, N_samples, 3)
     pts = ro[..., None, :] + rd[..., None, :] * z_vals[..., :, None]
@@ -159,8 +159,8 @@ def run_one_iter_of_nerf(
     else:
         ro = ray_origins.view((-1, 3))
         rd = ray_directions.view((-1, 3))
-    near = options.dataset["near"] * torch.ones_like(rd[..., :1])
-    far = options.dataset["far"] * torch.ones_like(rd[..., :1])
+    near = options.dataset["near"] * torch.ones_like(rd[..., :1], device='cuda')
+    far = options.dataset["far"] * torch.ones_like(rd[..., :1], device='cuda')
     rays = torch.cat((ro, rd, near, far), dim=-1)
     if options.nerf["use_viewdirs"]:
         rays = torch.cat((rays, viewdirs), dim=-1)

@@ -58,13 +58,7 @@ if __name__ == "__main__":
     args.gpu_num = torch.cuda.device_count()
     
     # save config
-    os.makedirs(f"train_result/{args.run_id}", exist_ok=True)
+    os.makedirs(f"{args.save_root}/{args.run_id}", exist_ok=True)
     # args.save_yaml()
 
-    # Set up multi-GPU training
-    if args.use_mGPU:  
-        torch.multiprocessing.spawn(train, nprocs=args.gpu_num, args=(args.__dict__, ))
-
-    # Set up single GPU training
-    else:
-        train(gpu=0, args=args.__dict__)
+    torch.multiprocessing.spawn(train, nprocs=args.gpu_num, args=(args.__dict__, ))

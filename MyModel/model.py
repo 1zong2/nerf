@@ -6,12 +6,13 @@ import os, tqdm, wandb, torchvision
 import numpy as np
 import cv2, time
 from nerf import (get_embedding_function, get_ray_bundle, img2mse,
-                  load_blender_data, load_llff_data, meshgrid_xy, models,
+                  load_blender_data, get_params, load_llff_data, meshgrid_xy, models,
                   mse2psnr, run_one_iter_of_nerf)
 
 
 class MyModel(ModelInterface):
     def set_networks(self):
+        self.H, self.W, self.focal, self.render_poses = get_params(self.args.dataset["basedir"], half_res=self.args.dataset["half_res"])
 
         self.encode_position_fn = get_embedding_function(
             num_encoding_functions=self.args["models"]["coarse"]["num_encoding_fn_xyz"],
@@ -58,16 +59,6 @@ class MyModel(ModelInterface):
         self.model_coarse = torch.nn.parallel.DistributedDataParallel(self.model_coarse, device_ids=[self.gpu]).module
         self.model_fine = torch.nn.parallel.DistributedDataParallel(self.model_fine, device_ids=[self.gpu]).module
 
-    def set_dataset(self):
-        if self.args.dataset["type"].lower() == "blender":
-            self.images, self.poses, render_poses, hwf, i_split = load_blender_data(self.args.dataset["basedir"], half_res=self.args.dataset["half_res"], testskip=self.args.dataset["testskip"])
-            self.i_train, self.i_val, i_test = i_split
-            H, W, self.focal = hwf
-            self.H, self.W = int(H), int(W)
-            self.hwf = [self.H, self.W, self.focal]
-            if self.args.nerf["train"]["white_background"]:
-                self.images = self.images[..., :3] * self.images[..., -1:] + (1.0 - self.images[..., -1:])
-
     def set_optimizers(self):
         trainable_parameters = list(self.model_coarse.parameters())
         if self.model_fine is not None:
@@ -97,11 +88,20 @@ class MyModel(ModelInterface):
         # 6-1. mini batch
         ###########################
 
-        img_idx = np.random.choice(self.i_train)
-        img_target = self.images[img_idx].cuda()
-        pose_target = self.poses[img_idx, :3, :4].cuda()
+        try:
+            img, pose = next(self.train_iterator)
+        except StopIteration:
+            self.train_iterator = iter(self.train_dataloader)
+            img, pose = next(self.train_iterator)
+
+        img_target, pose = img[0].to(self.gpu), pose[0].to(self.gpu)
+        pose_target = pose[:3, :4]
+
+        if self.args.nerf["train"]["white_background"]:
+            self.images = self.images[..., :3] * self.images[..., -1:] + (1.0 - self.images[..., -1:])
+
         ray_origins, ray_directions = get_ray_bundle(self.H, self.W, self.focal, pose_target)
-        coords = torch.stack(meshgrid_xy(torch.arange(self.H).cuda(), torch.arange(self.W).cuda()), dim=-1).reshape((-1, 2))
+        coords = torch.stack(meshgrid_xy(torch.arange(int(self.H)).cuda(), torch.arange(int(self.W)).cuda()), dim=-1).reshape((-1, 2))
         
         select_inds = np.random.choice(coords.shape[0], size=(self.args.nerf["train"]["num_random_rays"]), replace=False)
         select_inds = coords[select_inds]
@@ -145,12 +145,22 @@ class MyModel(ModelInterface):
         if self.model_fine:
             self.model_fine.eval()
 
+        print(1)
+        time.sleep(5)
         start = time.time()
         with torch.no_grad():
-            img_idx = np.random.choice(self.i_val)
-            img_target = self.images[img_idx].cuda()
-            pose_target = self.poses[img_idx, :3, :4].cuda()
+            
+            try:
+                img, pose = next(self.valid_iterator)
+            except StopIteration:
+                self.valid_iterator = iter(self.valid_dataloader)
+                img, pose = next(self.valid_iterator)
+
+            img_target, pose = img[0].to(self.gpu), pose[0].to(self.gpu)
+            pose_target = pose[:3, :4]
+                
             ray_origins, ray_directions = get_ray_bundle(self.H, self.W, self.focal, pose_target)
+            
             rgb_coarse, _, _, rgb_fine, _, _ = run_one_iter_of_nerf(
                 self.H,
                 self.W,
@@ -164,18 +174,17 @@ class MyModel(ModelInterface):
                 encode_position_fn=self.encode_position_fn,
                 encode_direction_fn=self.encode_direction_fn,
             )
-
-            coarse_loss = img2mse(rgb_coarse[..., :3], img_target[..., :3])
+            coarse_loss = img2mse(rgb_coarse[..., :3], img_target[..., :3]).item()
             if rgb_fine is not None:
-                fine_loss = img2mse(rgb_fine[..., :3], img_target[..., :3])
+                fine_loss = img2mse(rgb_fine[..., :3], img_target[..., :3]).item()
             loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
-            psnr = mse2psnr(loss.item())
+            psnr = mse2psnr(loss)
 
             self.val_loss_dict = {}
-            self.val_loss_dict["loss_valid"] = loss.item(),
-            self.val_loss_dict["coarse_loss_valid"] = coarse_loss.item()
+            self.val_loss_dict["loss_valid"] = loss,
+            self.val_loss_dict["coarse_loss_valid"] = coarse_loss
             if rgb_fine is not None:
-                self.val_loss_dict["fine_loss_valid"] = fine_loss.item()
+                self.val_loss_dict["fine_loss_valid"] = fine_loss
             self.val_loss_dict["psnr_valid"] = psnr
             
             os.makedirs(f"{self.args.save_root}/{self.args.run_id}/validation/rgb_coarse/", exist_ok=True)
@@ -186,7 +195,7 @@ class MyModel(ModelInterface):
                 cv2.imwrite(f"{self.args.save_root}/{self.args.run_id}/validation/rgb_fine/{str(global_step).zfill(5)}.png", self.cast_to_image(rgb_fine[..., :3])[:, :, ::-1])
                 cv2.imwrite(f"{self.args.save_root}/{self.args.run_id}/validation/img_target/{str(global_step).zfill(5)}.png", self.cast_to_image(img_target[..., :3])[:, :, ::-1])
 
-            tqdm.tqdm.write(f"Validation loss: {str(round(loss.item(), 4))} | Validation PSNR: {str(round(psnr, 2))} | Time: {str(round(time.time() - start, 2))}")
+            tqdm.tqdm.write(f"Validation loss: {str(round(loss, 4))} | Validation PSNR: {str(round(psnr, 2))} | Time: {str(round(time.time() - start, 2))}")
 
         ###########################
         # 6-6. Checkpoints
